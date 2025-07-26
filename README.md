@@ -18,7 +18,7 @@ A CheckMK local check script for monitoring Tactical RMM (TRMM) installations. T
 Install the following packages on your TRMM server:
 
 - apt install curl jq
-  oder
+  or
 - dnf install curl jq
 
 ### TRMM Configuration
