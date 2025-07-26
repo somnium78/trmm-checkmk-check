@@ -1,0 +1,157 @@
+#!/bin/bash
+# TRMM CheckMK Local Check
+# Author: somnium78
+# Repository: https://github.com/somnium78/trmm-checkmk-check
+# License: GNU General Public License v3.0
+# Version: 1.1
+
+# =============================================================================
+# CONFIGURATION - PLEASE MODIFY THESE VALUES
+# =============================================================================
+
+# Your TRMM Monitoring Token (set in local_settings.py)
+TOKEN="YOUR_MONITORING_TOKEN_HERE"
+
+# Your TRMM API hostname (used in Host header)
+API_HOSTNAME="api.yourdomain.com"
+
+# Local API URL (should work with default nginx config)
+API_URL="http://127.0.0.1:8080/core/v2/status/"
+
+# =============================================================================
+# THRESHOLDS - MODIFY AS NEEDED
+# =============================================================================
+
+DISK_WARN_THRESHOLD=80
+DISK_CRIT_THRESHOLD=90
+MEMORY_WARN_THRESHOLD=80
+MEMORY_CRIT_THRESHOLD=90
+CERT_WARN_DAYS=30
+CERT_CRIT_DAYS=7
+QUEUE_WARN_LENGTH=50
+QUEUE_CRIT_LENGTH=100
+
+# =============================================================================
+# SCRIPT LOGIC - DO NOT MODIFY BELOW THIS LINE
+# =============================================================================
+
+# Check if required tools are available
+if ! command -v curl &> /dev/null; then
+    echo "2 TRMM_Status - curl is not installed. Please install curl package."
+    exit 1
+fi
+
+if ! command -v jq &> /dev/null; then
+    echo "2 TRMM_Status - jq is not installed. Please install jq package."
+    exit 1
+fi
+
+# TRMM API abfragen
+RESPONSE=$(curl -s -H "Host: $API_HOSTNAME" -H "X-Mon-Token: $TOKEN" "$API_URL" 2>/dev/null)
+
+if [ $? -eq 0 ] && [ -n "$RESPONSE" ]; then
+    # JSON parsen
+    AGENT_COUNT=$(echo "$RESPONSE" | jq -r '.agent_count // 0' 2>/dev/null || echo "0")
+    CLIENT_COUNT=$(echo "$RESPONSE" | jq -r '.client_count // 0' 2>/dev/null || echo "0")
+    SITE_COUNT=$(echo "$RESPONSE" | jq -r '.site_count // 0' 2>/dev/null || echo "0")
+    DISK_USAGE=$(echo "$RESPONSE" | jq -r '.disk_usage_percent // 0' 2>/dev/null || echo "0")
+    MEMORY_USAGE=$(echo "$RESPONSE" | jq -r '.mem_usage_percent // 0' 2>/dev/null || echo "0")
+    VERSION=$(echo "$RESPONSE" | jq -r '.version // "unknown"' 2>/dev/null || echo "unknown")
+    AGENT_VERSION=$(echo "$RESPONSE" | jq -r '.latest_agent_version // "unknown"' 2>/dev/null || echo "unknown")
+    CERT_DAYS=$(echo "$RESPONSE" | jq -r '.days_until_cert_expires // 0' 2>/dev/null || echo "0")
+    QUEUE_LEN=$(echo "$RESPONSE" | jq -r '.celery_queue_len // 0' 2>/dev/null || echo "0")
+    QUEUE_HEALTH=$(echo "$RESPONSE" | jq -r '.celery_queue_health // "unknown"' 2>/dev/null || echo "unknown")
+
+    # CheckMK Local Check Format: STATUS SERVICE_NAME METRICS MESSAGE
+
+    # Disk Usage Check
+    if [ "$DISK_USAGE" -gt "$DISK_CRIT_THRESHOLD" ]; then
+        echo "2 TRMM_Disk usage=${DISK_USAGE}% Disk usage CRITICAL: ${DISK_USAGE}%"
+    elif [ "$DISK_USAGE" -gt "$DISK_WARN_THRESHOLD" ]; then
+        echo "1 TRMM_Disk usage=${DISK_USAGE}% Disk usage WARNING: ${DISK_USAGE}%"
+    else
+        echo "0 TRMM_Disk usage=${DISK_USAGE}% Disk usage OK: ${DISK_USAGE}%"
+    fi
+
+    # Memory Usage Check
+    if [ "$MEMORY_USAGE" -gt "$MEMORY_CRIT_THRESHOLD" ]; then
+        echo "2 TRMM_Memory usage=${MEMORY_USAGE}% Memory usage CRITICAL: ${MEMORY_USAGE}%"
+    elif [ "$MEMORY_USAGE" -gt "$MEMORY_WARN_THRESHOLD" ]; then
+        echo "1 TRMM_Memory usage=${MEMORY_USAGE}% Memory usage WARNING: ${MEMORY_USAGE}%"
+    else
+        echo "0 TRMM_Memory usage=${MEMORY_USAGE}% Memory usage OK: ${MEMORY_USAGE}%"
+    fi
+
+    # Certificate Check
+    if [ "$CERT_DAYS" -lt "$CERT_CRIT_DAYS" ]; then
+        echo "2 TRMM_Certificate days_until_expires=${CERT_DAYS} Certificate expires in ${CERT_DAYS} days - CRITICAL"
+    elif [ "$CERT_DAYS" -lt "$CERT_WARN_DAYS" ]; then
+        echo "1 TRMM_Certificate days_until_expires=${CERT_DAYS} Certificate expires in ${CERT_DAYS} days - WARNING"
+    else
+        echo "0 TRMM_Certificate days_until_expires=${CERT_DAYS} Certificate expires in ${CERT_DAYS} days - OK"
+    fi
+
+    # Celery Queue Check
+    if [ "$QUEUE_LEN" -gt "$QUEUE_CRIT_LENGTH" ]; then
+        echo "2 TRMM_Queue queue_length=${QUEUE_LEN} Celery queue length CRITICAL: ${QUEUE_LEN} (Health: ${QUEUE_HEALTH})"
+    elif [ "$QUEUE_LEN" -gt "$QUEUE_WARN_LENGTH" ]; then
+        echo "1 TRMM_Queue queue_length=${QUEUE_LEN} Celery queue length WARNING: ${QUEUE_LEN} (Health: ${QUEUE_HEALTH})"
+    else
+        echo "0 TRMM_Queue queue_length=${QUEUE_LEN} Celery queue OK: ${QUEUE_LEN} items (Health: ${QUEUE_HEALTH})"
+    fi
+
+    # Agent Count Info
+    echo "0 TRMM_Agents agents=${AGENT_COUNT}|clients=${CLIENT_COUNT}|sites=${SITE_COUNT} TRMM managing ${AGENT_COUNT} agents across ${CLIENT_COUNT} clients in ${SITE_COUNT} sites (Version: ${VERSION}, Agent: ${AGENT_VERSION})"
+
+    # Services Check
+    SERVICES_OK=$(echo "$RESPONSE" | jq -r '.services_running | to_entries | map(select(.value == true)) | length' 2>/dev/null || echo "0")
+    SERVICES_TOTAL=$(echo "$RESPONSE" | jq -r '.services_running | length' 2>/dev/null || echo "0")
+
+    if [ "$SERVICES_OK" -eq "$SERVICES_TOTAL" ] && [ "$SERVICES_TOTAL" -gt 0 ]; then
+        echo "0 TRMM_Services services_ok=${SERVICES_OK} All ${SERVICES_TOTAL} TRMM services running"
+    else
+        echo "2 TRMM_Services services_ok=${SERVICES_OK} Only ${SERVICES_OK}/${SERVICES_TOTAL} TRMM services running"
+    fi
+
+    # Connectivity Checks
+    REDIS_PING=$(echo "$RESPONSE" | jq -r '.redis_ping // false' 2>/dev/null)
+    NATS_STD_PING=$(echo "$RESPONSE" | jq -r '.nats_std_ping // false' 2>/dev/null)
+    NATS_WS_PING=$(echo "$RESPONSE" | jq -r '.nats_ws_ping // false' 2>/dev/null)
+    MESH_PING=$(echo "$RESPONSE" | jq -r '.mesh_ping // false' 2>/dev/null)
+
+    CONNECTIVITY_ISSUES=0
+    CONNECTIVITY_MSG=""
+
+    if [ "$REDIS_PING" != "true" ]; then
+        CONNECTIVITY_ISSUES=$((CONNECTIVITY_ISSUES + 1))
+        CONNECTIVITY_MSG="${CONNECTIVITY_MSG}Redis "
+    fi
+    if [ "$NATS_STD_PING" != "true" ]; then
+        CONNECTIVITY_ISSUES=$((CONNECTIVITY_ISSUES + 1))
+        CONNECTIVITY_MSG="${CONNECTIVITY_MSG}NATS-STD "
+    fi
+    if [ "$NATS_WS_PING" != "true" ]; then
+        CONNECTIVITY_ISSUES=$((CONNECTIVITY_ISSUES + 1))
+        CONNECTIVITY_MSG="${CONNECTIVITY_MSG}NATS-WS "
+    fi
+    if [ "$MESH_PING" != "true" ]; then
+        CONNECTIVITY_ISSUES=$((CONNECTIVITY_ISSUES + 1))
+        CONNECTIVITY_MSG="${CONNECTIVITY_MSG}MeshCentral "
+    fi
+
+    if [ "$CONNECTIVITY_ISSUES" -eq 0 ]; then
+        echo "0 TRMM_Connectivity - All connectivity checks OK (Redis, NATS, MeshCentral)"
+    else
+        echo "2 TRMM_Connectivity - Connectivity issues with: ${CONNECTIVITY_MSG}"
+    fi
+
+else
+    echo "2 TRMM_Status - TRMM API not responding or invalid response"
+    echo "2 TRMM_Disk - Unable to retrieve disk usage data"
+    echo "2 TRMM_Memory - Unable to retrieve memory usage data"
+    echo "2 TRMM_Certificate - Unable to retrieve certificate data"
+    echo "2 TRMM_Queue - Unable to retrieve queue data"
+    echo "2 TRMM_Agents - Unable to retrieve agent data"
+    echo "2 TRMM_Services - Unable to retrieve service data"
+    echo "2 TRMM_Connectivity - Unable to retrieve connectivity data"
+fi
